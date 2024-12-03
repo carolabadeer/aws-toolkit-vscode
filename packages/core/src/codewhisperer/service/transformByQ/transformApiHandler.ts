@@ -22,6 +22,7 @@ import {
     ZipManifest,
 } from '../../models/model'
 import { getLogger } from '../../../shared/logger'
+import * as localizedText from '../../../shared/localizedText'
 import {
     CreateUploadUrlResponse,
     ProgressUpdates,
@@ -33,9 +34,14 @@ import {
 import { sleep } from '../../../shared/utilities/timeoutUtils'
 import AdmZip from 'adm-zip'
 import globals from '../../../shared/extensionGlobals'
-import { CredentialSourceId, telemetry } from '../../../shared/telemetry/telemetry'
+import {
+    CredentialSourceId,
+    CodeTransformBuildCommand,
+    telemetry,
+    CodeTransformCancelSrcComponents,
+} from '../../../shared/telemetry/telemetry'
 import { CodeTransformTelemetryState } from '../../../amazonqGumby/telemetry/codeTransformTelemetryState'
-import { calculateTotalLatency } from '../../../amazonqGumby/telemetry/codeTransformTelemetry'
+import { calculateTotalLatency, CancelActionPositions } from '../../../amazonqGumby/telemetry/codeTransformTelemetry'
 import { MetadataResult } from '../../../shared/telemetry/telemetryClient'
 import request from '../../../shared/request'
 import { JobStoppedError, ZipExceedsSizeLimitError } from '../../../amazonqGumby/errors'
@@ -43,10 +49,17 @@ import { writeLogs } from './transformFileHandler'
 import { AuthUtil } from '../../util/authUtil'
 import { createCodeWhispererChatStreamingClient } from '../../../shared/clients/codewhispererChatClient'
 import { downloadExportResultArchive } from '../../../shared/utilities/download'
-import { ExportIntent, TransformationDownloadArtifactType } from '@amzn/codewhisperer-streaming'
+import { ExportIntent, ExportContext, TransformationDownloadArtifactType } from '@amzn/codewhisperer-streaming'
 import fs from '../../../shared/fs/fs'
 import { ChatSessionManager } from '../../../amazonqGumby/chat/storages/chatSession'
 import { convertToTimeString, encodeHTML } from '../../../shared/utilities/textUtilities'
+import { DiffModel } from './transformationResultsViewProvider'
+import * as fsPromises from 'fs/promises'
+import * as fsLib from 'fs'
+import { spawnSync } from 'child_process' // Consider using ChildProcess once we finalize all spawnSync calls
+import { setContext } from '../../../shared/vscode/setContext'
+import { submitFeedback } from '../../../feedback/vue/submitFeedback'
+import { placeholder } from '../../../shared/vscode/commands2'
 
 export function getSha256(buffer: Buffer) {
     const hasher = crypto.createHash('sha256')
@@ -173,6 +186,58 @@ export async function stopJob(jobId: string) {
         const errorMessage = (e as Error).message
         getLogger().error(`CodeTransformation: StopTransformation error = ${errorMessage}`)
         throw new Error('Stop job failed')
+    }
+}
+
+export async function stopTransformByQ(
+    jobId: string,
+    cancelSrc: CancelActionPositions = CancelActionPositions.BottomHubPanel
+) {
+    getLogger().info(`In stopTransformByQ: state = ${transformByQState.getStatus()}`)
+    if (transformByQState.isRunning()) {
+        getLogger().info('CodeTransformation: User requested to stop transformation. Stopping transformation.')
+        transformByQState.setToCancelled()
+        transformByQState.setPolledJobStatus('CANCELLED')
+        await setContext('gumby.isStopButtonAvailable', false)
+        try {
+            await stopJob(jobId)
+            void vscode.window
+                .showErrorMessage(
+                    CodeWhispererConstants.jobCancelledNotification,
+                    CodeWhispererConstants.amazonQFeedbackText
+                )
+                .then((choice) => {
+                    if (choice === CodeWhispererConstants.amazonQFeedbackText) {
+                        void submitFeedback(
+                            placeholder,
+                            CodeWhispererConstants.amazonQFeedbackKey,
+                            `Q CodeTransform jobId: ${transformByQState.getJobId()}`
+                        )
+                    }
+                })
+        } catch (err) {
+            void vscode.window
+                .showErrorMessage(
+                    CodeWhispererConstants.errorStoppingJobNotification,
+                    CodeWhispererConstants.amazonQFeedbackText
+                )
+                .then((choice) => {
+                    if (choice === CodeWhispererConstants.amazonQFeedbackText) {
+                        void submitFeedback(
+                            placeholder,
+                            CodeWhispererConstants.amazonQFeedbackKey,
+                            `Q CodeTransform jobId: ${transformByQState.getJobId()}`
+                        )
+                    }
+                })
+            getLogger().error(`CodeTransformation: Error stopping transformation ${err}`)
+        } finally {
+            telemetry.codeTransform_jobIsCancelledByUser.emit({
+                codeTransformCancelSrcComponents: cancelSrc as CodeTransformCancelSrcComponents,
+                codeTransformSessionId: CodeTransformTelemetryState.instance.getSessionId(),
+                result: MetadataResult.Pass,
+            })
+        }
     }
 }
 
@@ -629,6 +694,15 @@ export async function pollTransformationJob(jobId: string, validStates: string[]
             if (validStates.includes(status)) {
                 break
             }
+
+            if (
+                CodeWhispererConstants.validStatesForPlanGenerated.includes(status) &&
+                !transformByQState.getWaitingForClientSideBuildAuthorization()
+            ) {
+                // only process awaiting client action when plan is generated (status = transforming)
+                await sleep(CodeWhispererConstants.transformationJobPollingIntervalSeconds * 1000)
+                await processAwaitingClientActionStatus(jobId)
+            }
             /**
              * If we find a paused state, we need the user to take action. We will set the global
              * state for polling status and early exit.
@@ -676,7 +750,8 @@ export function findDownloadArtifactStep(transformationSteps: TransformationStep
             for (let j = 0; j < progressUpdates.length; j++) {
                 if (
                     progressUpdates[j].downloadArtifacts?.[0]?.downloadArtifactType ||
-                    progressUpdates[j].downloadArtifacts?.[0]?.downloadArtifactId
+                    (progressUpdates[j].downloadArtifacts?.[0]?.downloadArtifactId &&
+                        progressUpdates[j].status === 'AWAITING_CLIENT_ACTION')
                 ) {
                     return {
                         transformationStep: transformationSteps[i],
@@ -696,20 +771,25 @@ export async function downloadResultArchive(
     jobId: string,
     downloadArtifactId: string | undefined,
     pathToArchive: string,
-    downloadArtifactType: TransformationDownloadArtifactType
+    downloadArtifactType: TransformationDownloadArtifactType,
+    exportContext?: ExportContext
 ) {
     let downloadErrorMessage = undefined
     const cwStreamingClient = await createCodeWhispererChatStreamingClient()
 
     try {
-        await downloadExportResultArchive(
-            cwStreamingClient,
-            {
-                exportId: jobId,
-                exportIntent: ExportIntent.TRANSFORMATION,
-            },
-            pathToArchive
-        )
+        let args =
+            downloadArtifactType === TransformationDownloadArtifactType.CLIENT_INSTRUCTIONS
+                ? {
+                      exportId: jobId,
+                      exportIntent: ExportIntent.TRANSFORMATION,
+                      exportContext: exportContext,
+                  }
+                : {
+                      exportId: jobId,
+                      exportIntent: ExportIntent.TRANSFORMATION,
+                  }
+        await downloadExportResultArchive(cwStreamingClient, args, pathToArchive)
     } catch (e: any) {
         downloadErrorMessage = (e as Error).message
         getLogger().error(`CodeTransformation: ExportResultArchive error = ${downloadErrorMessage}`)
@@ -723,7 +803,8 @@ export async function downloadAndExtractResultArchive(
     jobId: string,
     downloadArtifactId: string | undefined,
     pathToArchiveDir: string,
-    downloadArtifactType: TransformationDownloadArtifactType
+    downloadArtifactType: TransformationDownloadArtifactType,
+    exportContext?: ExportContext
 ) {
     const archivePathExists = await fs.existsDir(pathToArchiveDir)
     if (!archivePathExists) {
@@ -735,7 +816,7 @@ export async function downloadAndExtractResultArchive(
     let downloadErrorMessage = undefined
     try {
         // Download and deserialize the zip
-        await downloadResultArchive(jobId, downloadArtifactId, pathToArchive, downloadArtifactType)
+        await downloadResultArchive(jobId, downloadArtifactId, pathToArchive, downloadArtifactType, exportContext)
         const zip = new AdmZip(pathToArchive)
         zip.extractAllTo(pathToArchiveDir)
     } catch (e) {
@@ -758,4 +839,311 @@ export async function downloadHilResultArchive(jobId: string, downloadArtifactId
     const manifestFileVirtualFileReference = vscode.Uri.file(path.join(pathToArchiveDir, 'manifest.json'))
     const pomFileVirtualFileReference = vscode.Uri.file(path.join(pathToArchiveDir, 'pomFolder', 'pom.xml'))
     return { manifestFileVirtualFileReference, pomFileVirtualFileReference }
+}
+
+export async function processAwaitingClientActionStatus(jobId: string) {
+    // process client-side build results
+    throwIfCancelled()
+    await sleep(CodeWhispererConstants.transformationJobPollingIntervalSeconds * 1000)
+
+    // get client instructions artifact ID
+    let transformationStatus = await getClientInstructionArtifactId(jobId)
+    if (transformationStatus === null || transformationStatus === undefined) {
+        getLogger().error('Client Instruction Artifact ID is null or undefined')
+        return
+    }
+
+    if (transformationStatus?.IsWaitingForClientAction) {
+        // extract client instructions
+        if (!transformationStatus.ClientInstructionArtifactId) {
+            throw new Error('Failed to get client instruction artifact ID')
+        }
+        await sleep(CodeWhispererConstants.transformationJobPollingIntervalSeconds * 1000)
+        let clientInstructions = await extractClientInstructions(
+            jobId,
+            transformationStatus.ClientInstructionArtifactId
+        )
+
+        // process client instructions
+        try {
+            await sleep(CodeWhispererConstants.transformationJobPollingIntervalSeconds * 1000)
+            await processClientInstructions(jobId, clientInstructions, transformationStatus.ClientInstructionArtifactId)
+        } catch (err) {
+            // await stopTransformByQ(transformByQState.getJobId(), CancelActionPositions.Chat)
+            throw new Error('process client instructions failed: ' + err)
+        }
+    }
+}
+
+async function getClientInstructionArtifactId(jobId: string) {
+    // Service call 2) GetTransformationPlan for step-by-step status
+    await sleep(CodeWhispererConstants.transformationJobPollingIntervalSeconds * 1000)
+    const plan_status = await getTransformationSteps(jobId, false)
+    const { transformationStep, progressUpdate } = findDownloadArtifactStep(plan_status)
+
+    getLogger().info(`transformationStep: ${transformationStep}, progressUpdate: ${progressUpdate}`)
+    getLogger().info(
+        `current progressUpdate: name = ${progressUpdate?.name}, status = ${progressUpdate?.status}, description = ${progressUpdate?.description}`
+    )
+
+    if (progressUpdate?.status === 'AWAITING_CLIENT_ACTION') {
+        let artifact = progressUpdate.downloadArtifacts?.[0]
+        let download_artifact_type = artifact?.downloadArtifactType
+        getLogger().info(`download_artifact_type: ${download_artifact_type}`)
+
+        if (download_artifact_type !== 'CLIENT_INSTRUCTIONS') {
+            throw new Error(
+                'Received unexpected downloadArtifactType: ' + download_artifact_type + 'for jobId: ' + jobId
+            )
+        }
+
+        let clientInstructionArtifactId = artifact?.downloadArtifactId
+        getLogger().info(`clientInstructionArtifactId: ${clientInstructionArtifactId}`)
+
+        return {
+            IsTransformationCompleted: false,
+            IsWaitingForClientAction: true,
+            ClientInstructionArtifactId: clientInstructionArtifactId,
+        }
+    }
+}
+
+async function loadManifestFile(directory: string): Promise<any> {
+    try {
+        const manifestPath = path.join(directory, 'manifest.json')
+        const data = await fsPromises.readFile(manifestPath, 'utf8')
+        const manifest = JSON.parse(data)
+        return manifest
+    } catch (err) {
+        throw new Error(`Error reading manifest file: ${err}`)
+    }
+}
+
+function copyDirectory(sourcePath: string, destinationPath: string): void {
+    // Create the destination directory if it doesn't exist
+    fsLib.mkdirSync(destinationPath, { recursive: true })
+
+    // Read the contents of the source directory
+    const files = fsLib.readdirSync(sourcePath)
+
+    // Loop through each item in the source directory
+    for (const file of files) {
+        const sourceFilePath = path.join(sourcePath, file)
+        const destinationFilePath = path.join(destinationPath, file)
+
+        // Check if the item is a directory or a file
+        const stats = fsLib.statSync(sourceFilePath)
+
+        // Skip hidden directories and files
+        if (file.startsWith('.')) {
+            continue
+        }
+
+        if (stats.isDirectory()) {
+            // If the item is a directory, recursively copy it
+            const destinationFilePath = path.join(destinationPath, path.relative(sourcePath, sourceFilePath))
+            copyDirectory(sourceFilePath, destinationFilePath)
+        } else {
+            // If the item is a file, copy its contents
+            fsLib.copyFileSync(sourceFilePath, destinationFilePath)
+        }
+    }
+}
+
+async function extractClientInstructions(jobId: string, clientInstructionsArtifactId: string) {
+    const operationName = 'client_instructions' // only used for logging and file naming purposes
+    let exportDestination = `${operationName}_${clientInstructionsArtifactId}`
+    let exportZipPath: string = path.join(os.tmpdir(), `${exportDestination}.zip`)
+    getLogger().info(`Downloading client instructions`)
+
+    const exportContext: ExportContext = {
+        transformationExportContext: {
+            downloadArtifactType: TransformationDownloadArtifactType.CLIENT_INSTRUCTIONS,
+            downloadArtifactId: clientInstructionsArtifactId,
+        },
+    }
+    await downloadAndExtractResultArchive(
+        jobId,
+        clientInstructionsArtifactId,
+        exportZipPath,
+        TransformationDownloadArtifactType.CLIENT_INSTRUCTIONS,
+        exportContext
+    )
+    let clientInstructionsManifest = await loadManifestFile(exportZipPath)
+
+    return {
+        capability: clientInstructionsManifest.capability,
+        buildCommand: clientInstructionsManifest.build_command,
+        patchFilePath: path.join(exportZipPath, clientInstructionsManifest.diffFileName),
+    }
+}
+
+async function processClientInstructions(jobid: string, clientInstructions: any, clientInstructionArtifactId: string) {
+    // create temp branch or copy of original code
+    let sourcePath = transformByQState.getProjectPath()
+    // let destinationPath = path.join(os.tmpdir(), buildOutputDirName)
+    const destinationPath = path.join(os.tmpdir(), 'originalCopy')
+    copyDirectory(sourcePath, destinationPath)
+    // apply changes to temp branch or copy
+    const diffModel = new DiffModel()
+    diffModel.parseDiff(clientInstructions.patchFilePath, destinationPath)
+    const doc = await vscode.workspace.openTextDocument(clientInstructions.patchFilePath)
+    await vscode.window.showTextDocument(doc)
+    // build
+    try {
+        // run client side build on the temp directory with the changes applied -> transformByQState.getProjectCopyFilePath
+        await runClientSideBuild(transformByQState.getProjectCopyFilePath(), clientInstructionArtifactId)
+    } catch (err) {
+        throw new Error('Client-side build failed: ' + err)
+    }
+}
+
+async function runClientSideBuild(modulePath: string, clientInstructionArtifactId: string) {
+    try {
+        telemetry.codeTransform_localBuildProject.run(async () => {
+            telemetry.record({ codeTransformSessionId: CodeTransformTelemetryState.instance.getSessionId() })
+
+            // baseCommand will be one of: '.\mvnw.cmd', './mvnw', 'mvn'
+            const baseCommand = transformByQState.getMavenName()
+
+            transformByQState.appendToErrorLog(`Running command ${baseCommand} test`)
+
+            const args = ['test']
+            let environment = process.env
+
+            // set java home to target java version for intermediate builds
+            environment = { ...process.env, JAVA_HOME: transformByQState.getJavaTargetPath() }
+            getLogger().info(`JAVA_HOME: ${environment.JAVA_HOME}`)
+
+            let userChoice: string | undefined = undefined
+            if (
+                transformByQState.getClientSideBuildSelection() === 'Verify Each Iteration' &&
+                !transformByQState.getWaitingForClientSideBuildAuthorization()
+            ) {
+                if (userChoice === undefined) {
+                    transformByQState.setWaitingForClientSideBuildAuthorization(true)
+                    userChoice = await vscode.window.showInformationMessage(
+                        'Do you authorize Amazon Q to perform an intermediate build on this machine?',
+                        { modal: true },
+                        localizedText.yes,
+                        localizedText.no
+                    )
+                }
+
+                if (userChoice === localizedText.no) {
+                    // undefined -> dialog dismissed or closed
+                    transformByQState.setWaitingForClientSideBuildAuthorization(false)
+                    await stopTransformByQ(transformByQState.getJobId(), CancelActionPositions.Chat)
+                    throw new Error(
+                        'Cannot perform intermediate client-side build since intermediate verification prompt was rejected'
+                    )
+                }
+
+                if (userChoice === undefined) {
+                    transformByQState.setWaitingForClientSideBuildAuthorization(true)
+                    return
+                }
+            }
+
+            transformByQState.setWaitingForClientSideBuildAuthorization(false)
+            const argString = args.join(' ')
+            const spawnResult = spawnSync(baseCommand, args, {
+                cwd: modulePath,
+                shell: true,
+                encoding: 'utf-8',
+                env: environment,
+                maxBuffer: CodeWhispererConstants.maxBufferSize,
+            })
+
+            let mavenBuildCommand = transformByQState.getMavenName()
+            // slashes not allowed in telemetry
+            if (mavenBuildCommand === './mvnw') {
+                mavenBuildCommand = 'mvnw'
+            } else if (mavenBuildCommand === '.\\mvnw.cmd') {
+                mavenBuildCommand = 'mvnw.cmd'
+            }
+            telemetry.record({ codeTransformBuildCommand: mavenBuildCommand as CodeTransformBuildCommand })
+
+            if (spawnResult.status !== 0) {
+                let errorLog = ''
+                errorLog += spawnResult.error ? JSON.stringify(spawnResult.error) : ''
+                errorLog += `${spawnResult.stderr}\n${spawnResult.stdout}`
+                transformByQState.appendToErrorLog(`${baseCommand} ${argString} failed: \n ${errorLog}`)
+                getLogger().error(
+                    `CodeTransformation: Error in running Maven ${argString} command ${baseCommand}. status = ${spawnResult.status}`
+                )
+                getLogger().error(`Maven ${argString} error`, { code: 'MavenExecutionError' })
+            }
+            let buildlogs = spawnResult.stdout
+            let buildLogsDir = await writeAndShowBuildLogs(clientInstructionArtifactId, buildlogs)
+            getLogger().info(`spawnResult.status: ${spawnResult.status}`)
+
+            if (spawnResult.status !== null) {
+                let buildLogFileName = 'build-output.log'
+                let manifestFilePath = path.join(buildLogsDir, 'manifest.json')
+                await updateManifestFile(spawnResult.status, buildLogFileName, manifestFilePath)
+
+                // create zip directory of build logs directory
+                const zip = new AdmZip()
+                zip.addLocalFile(`${buildLogsDir}/build-output.log`)
+                zip.addLocalFile(`${buildLogsDir}/manifest.json`)
+
+                // Write the ZIP file to disk
+                zip.writeZip(`${buildLogsDir}.zip`)
+                getLogger().info(`ZIP file created and files added successfully`)
+
+                // upload payload
+                const uploadContext: UploadContext = {
+                    transformationUploadContext: {
+                        jobId: transformByQState.getJobId(),
+                        uploadArtifactType: 'ClientBuildResult',
+                    },
+                }
+                await uploadPayload(`${buildLogsDir}.zip`, uploadContext)
+                await resumeTransformationJob(transformByQState.getJobId(), 'COMPLETED')
+            } else {
+                throw new Error(`${baseCommand} ${argString}  exit code is null`)
+            }
+        })
+    } catch (err) {
+        getLogger().error('Caught error in runClientSideBuild')
+        throw new Error('Client-side build failed: ' + err)
+    }
+}
+
+async function writeAndShowBuildLogs(clientInstructionArtifactId: string, buildLogs: string) {
+    const buildOutputDirName = `build_output_${clientInstructionArtifactId}`
+    const buildLogsDir = path.join(os.tmpdir(), buildOutputDirName)
+
+    // create build logs directory if it doesn't exist
+    try {
+        fsLib.mkdirSync(buildLogsDir, { recursive: true })
+        getLogger().info(`Directory created successfully!`)
+    } catch (err) {
+        getLogger().error(`Error creating directory`, err)
+    }
+    let buildLogFilePath = path.join(buildLogsDir, 'build-output.log')
+    buildLogFilePath = await writeLogs(buildLogFilePath, buildLogs)
+    const doc = await vscode.workspace.openTextDocument(buildLogFilePath)
+    await vscode.window.showTextDocument(doc)
+
+    getLogger().info(`buildLogsDir: ${buildLogsDir}`)
+    return buildLogsDir
+}
+
+async function updateManifestFile(exitCode: number, buildLogFileName: string, manifestFilePath: string) {
+    try {
+        const build_output_manifest = {
+            capability: 'CLIENT_SIDE_BUILD',
+            exitCode: exitCode,
+            commandLogFileName: buildLogFileName,
+        }
+        getLogger().info(`build_output_manifest: ${JSON.stringify(build_output_manifest)}`)
+        const updatedData = JSON.stringify(build_output_manifest, null, 2)
+        getLogger().info(`writing updatedData to manifestFilePath`)
+        await fsPromises.writeFile(manifestFilePath, updatedData, 'utf8')
+        console.log('Manifest file created successfully')
+    } catch (err) {
+        console.error('Error writing manifest file:', err)
+    }
 }

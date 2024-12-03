@@ -26,7 +26,6 @@ import {
     postTransformationJob,
     processTransformFormInput,
     startTransformByQ,
-    stopTransformByQ,
     validateCanCompileProject,
     setMaven,
 } from '../../../codewhisperer/commands/startTransformByQ'
@@ -52,7 +51,7 @@ import {
 } from '../../../shared/telemetry/telemetry'
 import { MetadataResult } from '../../../shared/telemetry/telemetryClient'
 import { CodeTransformTelemetryState } from '../../telemetry/codeTransformTelemetryState'
-import { getAuthType } from '../../../codewhisperer/service/transformByQ/transformApiHandler'
+import { getAuthType, stopTransformByQ } from '../../../codewhisperer/service/transformByQ/transformApiHandler'
 import DependencyVersions from '../../models/dependencies'
 import { getStringHash } from '../../../shared/utilities/textUtilities'
 import { getVersionData } from '../../../codewhisperer/service/transformByQ/transformMavenHandler'
@@ -363,6 +362,7 @@ export class GumbyController {
             const pathToProject: string = message.formSelectedValues['GumbyTransformProjectForm']
             const toJDKVersion: JDKVersion = message.formSelectedValues['GumbyTransformJdkToForm']
             const fromJDKVersion: JDKVersion = message.formSelectedValues['GumbyTransformJdkFromForm']
+            const clientSideBuildSelection: string = message.formSelectedValues['GumbyTransformClientSideBuildForm']
 
             telemetry.record({
                 codeTransformJavaSourceVersionsAllowed: JDKToTelemetryValue(
@@ -387,21 +387,28 @@ export class GumbyController {
                 return
             }
 
-            await processTransformFormInput(pathToProject, fromJDKVersion, toJDKVersion)
+            this.messenger.sendClientSideBuildSelectionMessage(clientSideBuildSelection, message.tabID)
+
+            await processTransformFormInput(pathToProject, fromJDKVersion, toJDKVersion, clientSideBuildSelection)
 
             await this.messenger.sendSkipTestsPrompt(message.tabID)
         })
     }
 
-    private async prepareProjectForSubmission(message: { pathToJavaHome: string; tabID: string }): Promise<void> {
+    private async prepareProjectForSubmission(message: { pathToJavaHome: string; tabID: string }) {
         if (message.pathToJavaHome) {
             transformByQState.setJavaHome(message.pathToJavaHome)
             getLogger().info(
                 `CodeTransformation: using JAVA_HOME = ${transformByQState.getJavaHome()} since source JDK does not match Maven JDK`
             )
         }
+        this.messenger.sendStaticTextResponse('java-target-not-set', message.tabID)
+        this.messenger.sendChatInputEnabled(message.tabID, true)
+        this.messenger.sendUpdatePlaceholder(message.tabID, 'Enter the path to your Java installation.')
+        this.sessionStorage.getSession().conversationState = ConversationState.PROMPT_JAVA_TARGET
+    }
 
-        // Pre-build project locally
+    private async prepareProjectForSubmissionHelper(message: { tabID: string }): Promise<void> {
         try {
             this.sessionStorage.getSession().conversationState = ConversationState.COMPILING
             this.messenger.sendCompilationInProgress(message.tabID)
@@ -450,7 +457,6 @@ export class GumbyController {
             }
             throw err
         }
-
         await this.prepareProjectForSubmission(message)
     }
 
@@ -487,18 +493,35 @@ export class GumbyController {
 
         const session = this.sessionStorage.getSession()
         switch (session.conversationState) {
-            case ConversationState.PROMPT_JAVA_HOME: {
-                const pathToJavaHome = extractPath(data.message)
+            case ConversationState.PROMPT_JAVA_HOME:
+                {
+                    const pathToJavaHome = extractPath(data.message)
 
-                if (pathToJavaHome) {
-                    await this.prepareProjectForSubmission({
-                        pathToJavaHome,
-                        tabID: data.tabID,
-                    })
-                } else {
-                    this.messenger.sendUnrecoverableErrorResponse('invalid-java-home', data.tabID)
+                    if (pathToJavaHome) {
+                        await this.prepareProjectForSubmission({
+                            pathToJavaHome,
+                            tabID: data.tabID,
+                        })
+                    } else {
+                        this.messenger.sendUnrecoverableErrorResponse('invalid-java-home', data.tabID)
+                    }
                 }
-            }
+                break
+            case ConversationState.PROMPT_JAVA_TARGET:
+                {
+                    const pathToJavaTarget = extractPath(data.message)
+                    getLogger().info(`CodeTransformation: using JAVA_TARGET = ${pathToJavaTarget}`)
+                    if (pathToJavaTarget) {
+                        transformByQState.setJavaTargetPath(pathToJavaTarget)
+                        getLogger().info(
+                            `Set java target in transformByQState to${transformByQState.getJavaTargetPath()}`
+                        )
+                        await this.prepareProjectForSubmissionHelper({ tabID: data.tabID })
+                    } else {
+                        this.messenger.sendUnrecoverableErrorResponse('invalid-java-home', data.tabID)
+                    }
+                }
+                break
         }
     }
 

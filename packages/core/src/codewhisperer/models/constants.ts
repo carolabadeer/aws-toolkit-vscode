@@ -366,7 +366,7 @@ export const validStatesForPlanGenerated = [
 
 export const failureStates = ['FAILED', 'STOPPING', 'STOPPED', 'REJECTED']
 
-export const pausedStates = ['PAUSED']
+export const pausedStates = ['PAUSED', 'AWATING_CLIENT_ACTION']
 
 // if status is COMPLETED or PARTIALLY_COMPLETED we can download artifacts
 export const validStatesForCheckingDownloadUrl = [
@@ -604,7 +604,7 @@ export const cleanInstallErrorNotification = `Amazon Q could not run the Maven c
 export const enterJavaHomeChatMessage = 'Enter the path to JDK '
 
 export const projectPromptChatMessage =
-    'I can upgrade your JAVA_VERSION_HERE. To start the transformation, I need some information from you. Choose the project you want to upgrade and the target code version to upgrade to. Then, choose Transform.'
+    'I can upgrade your JAVA_VERSION_HERE. To start the transformation, I need some information from you. First, choose the project you want to upgrade and the target code version to upgrade to. \n I will perform the upgrade in multiple steps and I will perform a Java 17 build on your host at the end of each step and obtain feedback. \n Would you prefer to review changes at each iteration or at the end of the transformation? \n Finally, choose Transform.'
 
 export const windowsJavaHomeHelpChatMessage =
     'To find the JDK path, run the following commands in a new terminal: `cd "C:/Program Files/Java"` and then `dir`. If you see your JDK version, run `cd <version>` and then `cd` to show the path.'
@@ -614,6 +614,9 @@ export const macJava8HomeHelpChatMessage =
 
 export const macJava11HomeHelpChatMessage =
     'To find the JDK path, run the following command in a new terminal:  `/usr/libexec/java_home -v 11`'
+
+export const macJava17HomeHelpChatMessage =
+    'To find the JDK path, run the following command in a new terminal:  `/usr/libexec/java_home -v 17`'
 
 export const linuxJavaHomeHelpChatMessage =
     'To find the JDK path, run the following command in a new terminal: `update-java-alternatives --list`'
@@ -633,6 +636,8 @@ export const chooseSourceVersionFormTitle = 'Choose the source code version'
 export const chooseTargetVersionFormTitle = 'Choose the target code version'
 
 export const skipUnitTestsFormTitle = 'Choose to skip unit tests'
+
+export const clientSideBuildEnvironmentTitle = 'Choose build environment for intermediate changes'
 
 export const skipUnitTestsFormMessage =
     'I will build your project using `mvn test` by default. If you would like me to build your project without running unit tests, I will use `mvn test-compile`.'

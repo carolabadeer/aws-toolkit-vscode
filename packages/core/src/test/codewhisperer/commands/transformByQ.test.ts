@@ -8,7 +8,7 @@ import * as vscode from 'vscode'
 import * as sinon from 'sinon'
 import { makeTemporaryToolkitFolder } from '../../../shared/filesystemUtilities'
 import { transformByQState, TransformByQStoppedError } from '../../../codewhisperer/models/model'
-import { parseBuildFile, stopTransformByQ } from '../../../codewhisperer/commands/startTransformByQ'
+import { parseBuildFile } from '../../../codewhisperer/commands/startTransformByQ'
 import { HttpResponse } from 'aws-sdk'
 import * as codeWhisperer from '../../../codewhisperer/client/codewhisperer'
 import * as CodeWhispererConstants from '../../../codewhisperer/models/constants'
@@ -29,6 +29,7 @@ import {
     updateJobHistory,
     zipCode,
     getTableMapping,
+    stopTransformByQ,
 } from '../../../codewhisperer/service/transformByQ/transformApiHandler'
 import {
     validateOpenProjects,

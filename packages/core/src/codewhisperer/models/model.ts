@@ -315,7 +315,7 @@ export class ZipManifest {
     buildLogs: string = 'build-logs.txt'
     version: string = '1.0'
     hilCapabilities: string[] = ['HIL_1pDependency_VersionUpgrade']
-    transformCapabilities: string[] = ['EXPLAINABILITY_V1']
+    transformCapabilities: string[] = ['EXPLAINABILITY_V1', 'CLIENT_SIDE_BUILD']
     customBuildCommand: string = 'clean test'
 }
 
@@ -407,6 +407,12 @@ export class TransformByQState {
     private planSteps: TransformationSteps | undefined = undefined
 
     private intervalId: NodeJS.Timeout | undefined = undefined
+
+    private clientSideBuildSelection: string = ''
+
+    private javaTargetPath: string = ''
+
+    private waitingForClientSideBuildAuthorization: boolean = false
 
     public isNotStarted() {
         return this.transformByQState === TransformByQStatus.NotStarted
@@ -532,6 +538,22 @@ export class TransformByQState {
         return this.intervalId
     }
 
+    public getClientSideBuildSelection() {
+        return this.clientSideBuildSelection
+    }
+
+    public getJavaTargetPath() {
+        return this.javaTargetPath
+    }
+
+    public getWaitingForClientSideBuildAuthorization() {
+        return this.waitingForClientSideBuildAuthorization
+    }
+
+    public setWaitingForClientSideBuildAuthorization(waiting: boolean) {
+        this.waitingForClientSideBuildAuthorization = waiting
+    }
+
     public appendToErrorLog(message: string) {
         this.errorLog += `${message}\n\n`
     }
@@ -642,6 +664,14 @@ export class TransformByQState {
 
     public setIntervalId(id: NodeJS.Timeout | undefined) {
         this.intervalId = id
+    }
+
+    public setClientSideBuildSelection(selection: string) {
+        this.clientSideBuildSelection = selection
+    }
+
+    public setJavaTargetPath(javaTargetPath: string) {
+        this.javaTargetPath = javaTargetPath
     }
 
     public setPlanSteps(steps: TransformationSteps) {
